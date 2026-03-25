@@ -165,4 +165,4 @@ dataset = Dataset.from_dict({
     "negative": final_negatives,
 })
 
-dataset.push_to_hub("trs4630/test")
+dataset.push_to_hub("trs4630/xquad-triplet")
