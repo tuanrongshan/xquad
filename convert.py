@@ -5,9 +5,16 @@ from typing import List, Dict, Any
 from datasets import Dataset
 from tqdm import tqdm
 from collections import defaultdict
-from inference import Inferencer
 from huggingface_hub import login
 from dotenv import load_dotenv
+
+from validators import (
+    inferencer,
+    check_answer_existence,
+    check_information_loss,
+    check_language_consistency,
+    parse_validation,
+)
 
 load_dotenv()
 
@@ -18,6 +25,7 @@ MAX_THREADS = 50
 MAX_ARTICLE = 1e8
 MAX_PARAGRAPH = 1e8
 MAX_QA = 1e8
+MAX_RETRIES = 3
 
 lang_code_dict = {
     "arabic": "ar",
@@ -34,38 +42,48 @@ lang_code_dict = {
     "chinese": "zh",
 }
 
-inferencer = Inferencer()
-
 # --- Core Logic Functions ---
 
-def trim_answer(context: str, answer: str, lang: str) -> str:
+def trim_answer(context: str, answer: str, lang: str, feedback: str | None = None) -> str:
     """
     Removes answer-related information.
     """
+    feedback_block = ""
+    if feedback:
+        feedback_block = f"""
+    PREVIOUS ATTEMPT DIAGNOSTICS (answer was not fully removed). Use this to do better:
+    {feedback}
+    """
     prompt = f"""
     TASK: Remove all traces of the specific "Target Answer" from the provided "Source Context".
-    
+
     GUIDELINES:
     1. Identify and delete sentences, phrases, or specific keywords that directly or indirectly reveal the Target Answer.
     2. LANGUAGE CONSTRAINT: You MUST output the text in {lang}. Do NOT translate the content to English.
     3. Maintain the grammatical flow and continuity of the remaining text.
     4. Do NOT invent new information to replace what was deleted.
     5. Output ONLY the modified text.
-
+    {feedback_block}
     [Target Answer]: {answer}
     [Source Context]: {context}
-    
+
     Modified Text ({lang} only):
     """
     return inferencer.model_inference(prompt, temperature=0.3).strip()
 
-def rephrase_context(context: str, lang: str) -> str:
+def rephrase_context(context: str, lang: str, feedback: str | None = None) -> str:
     """
     Pephrases the context to increase lexical diversity while preserving the remaining non-answer facts.
     """
+    feedback_block = ""
+    if feedback:
+        feedback_block = f"""
+    PREVIOUS ATTEMPT DIAGNOSTICS (information was lost and/or wrong language used). Use this to do better:
+    {feedback}
+    """
     prompt = f"""
     TASK: Rewrite the following text to enhance its linguistic variety while maintaining the original meaning of the remaining information.
-    
+
     GUIDELINES:
     1. Use different vocabulary, synonyms, and sentence structures (Paraphrasing).
     2. LANGUAGE CONSTRAINT: You MUST output the text in {lang}. Do NOT translate the content to English.
@@ -73,38 +91,58 @@ def rephrase_context(context: str, lang: str) -> str:
     4. Do NOT add any external information or facts not present in the source.
     5. The output must be logically consistent and professional.
     6. Output ONLY the rewritten text.
-
+    {feedback_block}
     [Source Text]: {context}
-    
+
     Rewritten Text ({lang} only):
     """
     return inferencer.model_inference(prompt, temperature=0.8).strip()
 
 def process_task(task_info: Dict[str, Any]):
     """
-    Processes a single language context for a specific question.
+    Processes a single language context for a specific question with inline
+    validation and retry. Returns None if MAX_RETRIES is exhausted.
     """
     lang = task_info['lang']
     context = task_info['context']
     answers = task_info['answers']
     q_id = task_info['q_id']
     query_text = task_info['query_text']
-    
-    # 1. Trim
-    tmp_context = context
-    for answer in answers:
-        tmp_context = trim_answer(tmp_context, answer["text"], lang.capitalize())
-    
-    # 2. Rephrase
-    negative_context = rephrase_context(tmp_context, lang.capitalize())
-    
-    return {
-        "q_id": q_id,
-        "query": query_text,
-        "lang": lang,
-        "positive": context,
-        "negative": negative_context
-    }
+
+    feedback = {"answer_leak": None, "info_loss": None, "lang_issue": None}
+    for _ in range(MAX_RETRIES):
+        # 1. Trim
+        tmp_context = context
+        for answer in answers:
+            tmp_context = trim_answer(
+                tmp_context, answer["text"], lang.capitalize(),
+                feedback=feedback["answer_leak"],
+            )
+
+        # 2. Rephrase
+        rephrase_feedback = "\n\n".join(
+            filter(None, [feedback["info_loss"], feedback["lang_issue"]])
+        ) or None
+        negative_context = rephrase_context(
+            tmp_context, lang.capitalize(), feedback=rephrase_feedback,
+        )
+
+        # 3. Validate
+        ans_check = check_answer_existence(negative_context, query_text)
+        loss_check = check_information_loss(context, negative_context)
+        lang_check = check_language_consistency(negative_context, lang.capitalize())
+        is_valid, feedback = parse_validation(ans_check, loss_check, lang_check)
+
+        if is_valid:
+            return {
+                "q_id": q_id,
+                "query": query_text,
+                "lang": lang,
+                "positive": context,
+                "negative": negative_context,
+            }
+
+    return None
 
 # --- Data Loading ---
 xquad_data = {}
@@ -138,7 +176,9 @@ results = []
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
     futures = [executor.submit(process_task, task) for task in all_tasks]
     for future in tqdm(concurrent.futures.as_completed(futures), total=len(all_tasks)):
-        results.append(future.result())
+        res = future.result()
+        if res is not None:
+            results.append(res)
 
 # --- Re-grouping Results ---
 grouped_data = defaultdict(lambda: {"query": "", "positive": {}, "negative": {}})
