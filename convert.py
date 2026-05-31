@@ -8,13 +8,15 @@ from collections import defaultdict
 from huggingface_hub import login
 from dotenv import load_dotenv
 
+from inference import Inferencer
 from validators import (
-    inferencer,
     check_answer_existence,
     check_information_loss,
     check_language_consistency,
     parse_validation,
 )
+
+inferencer = Inferencer()
 
 load_dotenv()
 
@@ -111,36 +113,40 @@ def process_task(task_info: Dict[str, Any]):
 
     feedback = {"answer_leak": None, "info_loss": None, "lang_issue": None}
     for _ in range(MAX_RETRIES):
-        # 1. Trim
-        tmp_context = context
-        for answer in answers:
-            tmp_context = trim_answer(
-                tmp_context, answer["text"], lang.capitalize(),
-                feedback=feedback["answer_leak"],
+        try:
+            # 1. Trim
+            tmp_context = context
+            for answer in answers:
+                tmp_context = trim_answer(
+                    tmp_context, answer["text"], lang.capitalize(),
+                    feedback=feedback["answer_leak"],
+                )
+
+            # 2. Rephrase
+            rephrase_feedback = "\n\n".join(
+                filter(None, [feedback["info_loss"], feedback["lang_issue"]])
+            ) or None
+            negative_context = rephrase_context(
+                tmp_context, lang.capitalize(), feedback=rephrase_feedback,
             )
 
-        # 2. Rephrase
-        rephrase_feedback = "\n\n".join(
-            filter(None, [feedback["info_loss"], feedback["lang_issue"]])
-        ) or None
-        negative_context = rephrase_context(
-            tmp_context, lang.capitalize(), feedback=rephrase_feedback,
-        )
+            # 3. Validate
+            ans_check = check_answer_existence(negative_context, query_text)
+            loss_check = check_information_loss(context, negative_context)
+            lang_check = check_language_consistency(negative_context, lang.capitalize())
+            is_valid, feedback = parse_validation(ans_check, loss_check, lang_check)
 
-        # 3. Validate
-        ans_check = check_answer_existence(negative_context, query_text)
-        loss_check = check_information_loss(context, negative_context)
-        lang_check = check_language_consistency(negative_context, lang.capitalize())
-        is_valid, feedback = parse_validation(ans_check, loss_check, lang_check)
-
-        if is_valid:
-            return {
-                "q_id": q_id,
-                "query": query_text,
-                "lang": lang,
-                "positive": context,
-                "negative": negative_context,
-            }
+            if is_valid:
+                return {
+                    "q_id": q_id,
+                    "query": query_text,
+                    "lang": lang,
+                    "positive": context,
+                    "negative": negative_context,
+                }
+        except Exception as e:
+            tqdm.write(f"[process_task error {q_id}/{lang}] {type(e).__name__}: {e}")
+            continue
 
     return None
 
@@ -176,9 +182,12 @@ results = []
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
     futures = [executor.submit(process_task, task) for task in all_tasks]
     for future in tqdm(concurrent.futures.as_completed(futures), total=len(all_tasks)):
-        res = future.result()
-        if res is not None:
-            results.append(res)
+        try:
+            res = future.result()
+            if res is not None:
+                results.append(res)
+        except Exception as e:
+            tqdm.write(f"[worker error] {type(e).__name__}: {e}")
 
 # --- Re-grouping Results ---
 grouped_data = defaultdict(lambda: {"query": "", "positive": {}, "negative": {}})
