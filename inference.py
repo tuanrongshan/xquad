@@ -10,7 +10,7 @@ class Inferencer:
         if self._framework == 'ollama':
             self.client = ollama.Client(host=base_url)
         elif self._framework == 'vllm':
-            self.client = OpenAI(base_url=base_url, api_key="")
+            self.client = OpenAI(base_url=base_url, api_key="jerry")
         else:
             raise ValueError("Unsupported framework.")
 
